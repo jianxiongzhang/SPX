@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek-V4-Flash 训练压测报告 — 2 Node (.10/.11)</title>
+<style>
+:root {
+  --bg: #fafafa; --card: #fff; --border: #ddd; --text: #111; --muted: #666; --accent: #1a56db;
+}
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 24px 32px 48px; background: var(--bg); color: var(--text); line-height: 1.55; max-width: 1200px; }
+h1 { font-size: 22px; margin: 0 0 8px; }
+h2 { font-size: 16px; margin: 28px 0 10px; border-bottom: 2px solid var(--accent); padding-bottom: 4px; }
+h3 { font-size: 14px; margin: 18px 0 8px; color: #333; }
+.meta { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; margin: 12px 0; }
+pre { background: #f4f4f5; border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font-size: 12px; line-height: 1.45; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; background: var(--card); }
+th, td { border: 1px solid var(--border); padding: 7px 9px; vertical-align: top; }
+th { background: #f0f4ff; text-align: left; font-weight: 600; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.sub { color: var(--muted); font-size: 11px; }
+.pos { color: #047857; } .neg { color: #b45309; }
+ul { margin: 6px 0; padding-left: 20px; }
+code { background: #f4f4f5; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>DeepSeek-V4-Flash 训练性能压测报告</h1>
+<p class="meta">
+  节点: <strong>10.6.142.10 + 10.6.142.11</strong> (2×8 GPU = 16 ranks) ·
+  模型参考: <code>/root/menyu/models/DeepSeek-V4-Flash-FP8</code> ·
+  运行次数: <strong>22</strong> (11 case × AR OFF/ON) ·
+  生成时间: 2026-06-28T15:23:33
+</p>
+
+<div class="card">
+<strong>测试目标</strong>：在 2 节点 16 GPU 上评估 DeepSeek-V4-Flash 两类训练 workload 的 step 吞吐，
+并对比 <strong>AR OFF</strong>（ECMP 基线）与 <strong>AR ON DDP ON</strong>（Adaptive Routing + SuperNIC 乱序重排）。
+<ul>
+  <li><strong>MoE EP 训练</strong> — 模拟 MoE dispatch/combine，主通信为 <code>All-to-All</code></li>
+  <li><strong>Dense DDP 训练</strong> — 模拟 Attention backbone，主通信为 <code>AllReduce</code></li>
+</ul>
+</div>
+
+<h2>1. 硬件拓扑</h2>
+<pre>
+┌─────────────────────────────────────┐     bond0 (10.6.142.0/24)     ┌─────────────────────────────────────┐
+│  R6KD-CX8aaS-GPU-10  (10.6.142.10)  │◄─────── IB RDMA 跨节点 ───────►│  R6KD-CX8aaS-GPU-11  (10.6.142.11)  │
+│  8 × NVIDIA GPU (~73 GB HBM each)   │                               │  8 × NVIDIA GPU (~73 GB HBM each)   │
+│  GPU PCI: 06/09/76/79/86/89/F6/F9   │                               │  同拓扑                               │
+└─────────────────────────────────────┘                               └─────────────────────────────────────┘
+         rank 0–7                                                              rank 8–15
+                    └────────────────── 16 ranks total ──────────────────────┘
+</pre>
+<table>
+<tr><th>属性</th><th>值</th></tr>
+<tr><td>Master 节点</td><td>10.6.142.10 (R6KD-CX8aaS-GPU-10)</td></tr>
+<tr><td>Worker 节点</td><td>10.6.142.11 (R6KD-CX8aaS-GPU-11)</td></tr>
+<tr><td>GPU / 节点</td><td class="num">8</td></tr>
+<tr><td>总 GPU (world_size)</td><td class="num">16</td></tr>
+<tr><td>显存</td><td>~73 GB / GPU</td></tr>
+<tr><td>计算精度</td><td>BF16</td></tr>
+</table>
+
+<h2>2. 网络拓扑</h2>
+<p>每节点 8 张 IB HCA；NCCL 选用其中 4 张参与集合通信：</p>
+<table>
+<tr><th>HCA</th><th>网口</th><th>NCCL 选用</th></tr>
+<tr><td>mlx5_0</td><td>enp115s0f0np0</td><td>✓</td></tr>
+<tr><td>mlx5_2</td><td>enp3s0f0np0</td><td>✓</td></tr>
+<tr><td>mlx5_4</td><td>enp243s0f0np0</td><td>✓</td></tr>
+<tr><td>mlx5_6</td><td>enp131s0f0np0</td><td>✓</td></tr>
+<tr><td>mlx5_1/3/5/7</td><td>对应 f1 口</td><td>未选用</td></tr>
+</table>
+
+<h3>NCCL / MPI 关键参数</h3>
+<table>
+<tr><th>参数</th><th>值</th><th>含义</th></tr>
+<tr><td><code>NCCL_IB_HCA</code></td><td>mlx5_0,mlx5_2,mlx5_4,mlx5_6</td><td>4 HCAs × 2 节点</td></tr>
+<tr><td><code>NCCL_P2P_DISABLE</code></td><td>1</td><td>禁用 GPU P2P，强制走 IB</td></tr>
+<tr><td><code>NCCL_SHM_DISABLE</code></td><td>1</td><td>禁用 SHM</td></tr>
+<tr><td><code>NCCL_SOCKET_IFNAME</code></td><td>bond0</td><td>OOB / bootstrap</td></tr>
+<tr><td><code>NCCL_IB_QPS_PER_CONNECTION</code></td><td>8</td><td>每连接 QP 数</td></tr>
+<tr><td><code>NCCL_ALGO</code></td><td>Ring</td><td>Ring 集合通信</td></tr>
+<tr><td><code>UCX_TLS</code></td><td>ib</td><td>OpenMPI UCX 走 IB</td></tr>
+<tr><td><code>LD_PRELOAD</code></td><td>libnccl.so.2 (custom build)</td><td>/root/jianxiong/nccl/build/lib/</td></tr>
+</table>
+
+<h2>3. 软件栈</h2>
+<table>
+<tr><th>组件</th><th>版本 / 路径</th></tr>
+<tr><td>Python</td><td>3.12 (conda env <code>pcie</code>)</td></tr>
+<tr><td>PyTorch</td><td>2.12.0+cu130</td></tr>
+<tr><td>启动器</td><td>OpenMPI <code>mpirun</code> + UCX PML</td></tr>
+<tr><td>hostfile</td><td><code>/root/jianxiong/5k_test/hostfile_2node_10_11</code></td></tr>
+<tr><td>运行脚本</td><td><code>/root/jianxiong/5k_test/run_dsv4_train_2node_10_11.sh</code></td></tr>
+</table>
+
+<h2>4. 并行训练拓扑</h2>
+
+<h3>4.1 Rank 映射</h3>
+<pre>
+hostfile_2node_10_11:
+  10.6.142.10  slots=8   →  rank 0–7   (local GPU 0–7)
+  10.6.142.11  slots=8   →  rank 8–15  (local GPU 0–7)
+
+mpirun: -npernode 8 --map-by slot --bind-to none
+MASTER_ADDR=10.6.142.10  MASTER_PORT=29502
+</pre>
+
+<h3>4.2 MoE EP=16（M1–M6, M8）</h3>
+<pre>
+EP Group (size=16):
+  Node .10: rank 0,1,2,3,4,5,6,7
+  Node .11: rank 8,9,10,11,12,13,14,15
+
+每个 MoE layer:
+  LayerNorm → All-to-All(dispatch) → expert FFN → All-to-All(combine) → residual
+  每层 2 次 All-to-All，跨 2 节点 IB 完成
+</pre>
+
+<h3>4.3 MoE EP=8（M7）</h3>
+<pre>
+EP Group 0: rank 0–7   (DP replica 0)
+EP Group 1: rank 8–15  (DP replica 1)
+All-to-All 仅在 8-rank 组内，跨节点流量减半
+</pre>
+
+<h3>4.4 Dense DDP（D1–D3）</h3>
+<pre>
+16 ranks 全局 DDP：每 rank 完整模型副本
+backward 后梯度 AllReduce (Ring, 16 GPU)
+</pre>
+
+<h2>5. AR OFF vs AR ON DDP ON</h2>
+<div class="two-col">
+<table>
+<tr><th>参数</th><th>AR OFF</th><th>AR ON DDP ON</th></tr>
+<tr><td><code>NCCL_IB_ADAPTIVE_ROUTING</code></td><td class="num">0</td><td class="num">1</td></tr>
+<tr><td><code>NCCL_IB_OOO_RQ</code></td><td class="num">0</td><td class="num">1</td></tr>
+<tr><td><code>NCCL_IB_RECEIVER_SIDE_MATCHING_SCHEME</code></td><td class="num">0</td><td class="num">1</td></tr>
+<tr><td><code>NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS</code></td><td class="num">0</td><td class="num">1</td></tr>
+<tr><td>其余 NCCL/MPI 参数</td><td colspan="2" style="text-align:center">完全相同</td></tr>
+</table>
+<div class="card" style="margin:0">
+<p><strong>AR OFF</strong>：ECMP 多路径 hash 分流，包可能乱序到达。</p>
+<p><strong>AR ON DDP ON</strong>：Adaptive Routing + 接收端乱序重排，适合 All-to-All 等多流 elephant flow。</p>
+<p>每个 case 均跑 <strong>AR OFF</strong> 和 <strong>AR ON DDP ON</strong> 两组，其余变量不变。</p>
+</div>
+</div>
+
+<h2>6. Case 设计</h2>
+
+<h3>6.1 MoE EP 训练 (M1–M8)</h3>
+<p>参考 DSV4-Flash: hidden=4096, ffn=2048, topk=6, experts=256。Bench 使用 <strong>128 experts</strong>（每 rank 持有全量 expert 副本，256 会 OOM）。</p>
+<table>
+<tr><th>Case</th><th>说明</th><th>EP</th><th>seq</th><th>bs/gpu</th><th>layers</th><th>hidden</th><th>ffn</th><th>experts</th></tr>
+<tr><td>M1</td><td>缩小维度基线</td><td class="num">16</td><td class="num">512</td><td class="num">1</td><td class="num">2</td><td class="num">2048</td><td class="num">1024</td><td class="num">128</td></tr>
+<tr><td>M2</td><td>长序列</td><td class="num">16</td><td class="num">1024</td><td class="num">1</td><td class="num">2</td><td class="num">2048</td><td class="num">1024</td><td class="num">128</td></tr>
+<tr><td>M3</td><td>大 micro-batch</td><td class="num">16</td><td class="num">512</td><td class="num">2</td><td class="num">2</td><td class="num">2048</td><td class="num">1024</td><td class="num">128</td></tr>
+<tr><td>M4</td><td>DSV4 真实 hidden/ffn</td><td class="num">16</td><td class="num">512</td><td class="num">1</td><td class="num">2</td><td class="num">4096</td><td class="num">2048</td><td class="num">128</td></tr>
+<tr><td>M5</td><td>DSV4 + 长序列</td><td class="num">16</td><td class="num">1024</td><td class="num">1</td><td class="num">2</td><td class="num">4096</td><td class="num">2048</td><td class="num">128</td></tr>
+<tr><td>M6</td><td>更深 MoE 栈</td><td class="num">16</td><td class="num">512</td><td class="num">1</td><td class="num">4</td><td class="num">4096</td><td class="num">2048</td><td class="num">128</td></tr>
+<tr><td>M7</td><td>EP 拓扑变体</td><td class="num">8</td><td class="num">512</td><td class="num">1</td><td class="num">2</td><td class="num">4096</td><td class="num">2048</td><td class="num">128</td></tr>
+<tr><td>M8</td><td>长上下文压测</td><td class="num">16</td><td class="num">2048</td><td class="num">1</td><td class="num">2</td><td class="num">4096</td><td class="num">2048</td><td class="num">128</td></tr>
+</table>
+
+<h3>6.2 Dense Attention DDP (D1–D3)</h3>
+<p>匹配 DSV4 attention: hidden=4096, heads=64, vocab=129280；用 4 层代替完整 43 层。</p>
+<table>
+<tr><th>Case</th><th>说明</th><th>seq</th><th>bs/gpu</th><th>layers</th></tr>
+<tr><td>D1</td><td>基线</td><td class="num">512</td><td class="num">1</td><td class="num">4</td></tr>
+<tr><td>D2</td><td>长序列</td><td class="num">1024</td><td class="num">1</td><td class="num">4</td></tr>
+<tr><td>D3</td><td>大 batch</td><td class="num">512</td><td class="num">2</td><td class="num">4</td></tr>
+</table>
+
+<h3>6.3 计时方法</h3>
+<ul>
+  <li>Warmup: 2 steps（不计入统计）</li>
+  <li>Benchmark: 6 steps（CUDA synchronized 计时）</li>
+  <li><code>tokens_per_step = batch_per_gpu × seq_len × 16</code></li>
+  <li><code>tokens/s = tokens_per_step / (ms_step_mean / 1000)</code></li>
+</ul>
+
+<h2>7. 执行步骤</h2>
+<ol>
+  <li><strong>环境准备</strong>：同步 <code>bench_*.py</code>、<code>hostfile_2node_10_11</code> 到 .10 / .11</li>
+  <li><strong>启动压测</strong>：<code>bash /root/jianxiong/5k_test/run_dsv4_train_2node_10_11.sh</code></li>
+  <li><strong>逐 case 执行</strong>（共 22 次）：
+    <ul>
+      <li>SSH 到 MASTER (.10)，activate conda <code>pcie</code></li>
+      <li>注入 NCCL 环境（AR OFF 或 AR ON DDP ON）</li>
+      <li><code>mpirun</code> 启动 16 进程（UCX/IB，传递 NCCL 变量）</li>
+      <li>运行 <code>bench_moe_train_dsv4.py</code> 或 <code>bench_dense_train_dsv4.py</code></li>
+      <li>rank 0 写 JSON → SCP 回控制端 → 追加 CSV</li>
+    </ul>
+  </li>
+  <li><strong>Case 顺序</strong>：M1(AR_OFF→ON) … M8(AR_OFF→ON) → D1 … D3</li>
+  <li><strong>生成报告</strong>：<code>generate_dsv4_train_2node_report.py</code></li>
+</ol>
+
+<h2>8. 测试结果 — MoE EP 训练</h2>
+<table>
+<tr>
+  <th>Case</th><th>EP</th><th>Seq</th><th>BS</th><th>L</th>
+  <th>ms/step OFF</th><th>ms/step ON</th><th>Δ ms</th>
+  <th>tok/s OFF</th><th>tok/s ON</th><th>Δ tok/s</th>
+</tr>
+<tr><td><strong>M1</strong><br><span class='sub'>缩小维度基线 (h=2048, E=128)</span></td><td class='num'>16</td><td class='num'>512</td><td class='num'>1</td><td class='num'>2</td><td class='num'>272.5</td><td class='num'>259.4</td><td class='num'>-4.8%</td><td class='num'>30,059</td><td class='num'>31,579</td><td class='num'>+5.1%</td></tr>
+<tr><td><strong>M2</strong><br><span class='sub'>长序列 (sl=1024)</span></td><td class='num'>16</td><td class='num'>1024</td><td class='num'>1</td><td class='num'>2</td><td class='num'>281.8</td><td class='num'>283.8</td><td class='num'>+0.7%</td><td class='num'>58,151</td><td class='num'>57,722</td><td class='num'>-0.7%</td></tr>
+<tr><td><strong>M3</strong><br><span class='sub'>大 micro-batch (bs=2)</span></td><td class='num'>16</td><td class='num'>512</td><td class='num'>2</td><td class='num'>2</td><td class='num'>292.8</td><td class='num'>301.3</td><td class='num'>+2.9%</td><td class='num'>55,964</td><td class='num'>54,373</td><td class='num'>-2.8%</td></tr>
+<tr><td><strong>M4</strong><br><span class='sub'>DSV4 真实 hidden/ffn (h=4096, ffn=2048)</span></td><td class='num'>16</td><td class='num'>512</td><td class='num'>1</td><td class='num'>2</td><td class='num'>307.9</td><td class='num'>302.7</td><td class='num'>-1.7%</td><td class='num'>26,608</td><td class='num'>27,062</td><td class='num'>+1.7%</td></tr>
+<tr><td><strong>M5</strong><br><span class='sub'>DSV4 + 长序列</span></td><td class='num'>16</td><td class='num'>1024</td><td class='num'>1</td><td class='num'>2</td><td class='num'>325.2</td><td class='num'>318.9</td><td class='num'>-1.9%</td><td class='num'>50,385</td><td class='num'>51,371</td><td class='num'>+2.0%</td></tr>
+<tr><td><strong>M6</strong><br><span class='sub'>更深 MoE 栈 (L=4)</span></td><td class='num'>16</td><td class='num'>512</td><td class='num'>1</td><td class='num'>4</td><td class='num'>579.8</td><td class='num'>582.9</td><td class='num'>+0.5%</td><td class='num'>14,129</td><td class='num'>14,055</td><td class='num'>-0.5%</td></tr>
+<tr><td><strong>M7</strong><br><span class='sub'>EP 拓扑变体 (EP=8, 2 DP groups)</span></td><td class='num'>8</td><td class='num'>512</td><td class='num'>1</td><td class='num'>2</td><td class='num'>287.3</td><td class='num'>289.9</td><td class='num'>+0.9%</td><td class='num'>28,516</td><td class='num'>28,258</td><td class='num'>-0.9%</td></tr>
+<tr><td><strong>M8</strong><br><span class='sub'>长上下文压测 (sl=2048)</span></td><td class='num'>16</td><td class='num'>2048</td><td class='num'>1</td><td class='num'>2</td><td class='num'>326.8</td><td class='num'>323.6</td><td class='num'>-1.0%</td><td class='num'>100,270</td><td class='num'>101,258</td><td class='num'>+1.0%</td></tr>
+</table>
+
+<h2>9. 测试结果 — Dense DDP 训练</h2>
+<table>
+<tr>
+  <th>Case</th><th>EP</th><th>Seq</th><th>BS</th><th>L</th>
+  <th>ms/step OFF</th><th>ms/step ON</th><th>Δ ms</th>
+  <th>tok/s OFF</th><th>tok/s ON</th><th>Δ tok/s</th>
+</tr>
+<tr><td><strong>D1</strong><br><span class='sub'>Attention DDP 基线 (sl=512, L=4)</span></td><td class='num'>—</td><td class='num'>512</td><td class='num'>1</td><td class='num'>4</td><td class='num'>259.7</td><td class='num'>258.8</td><td class='num'>-0.4%</td><td class='num'>31,543</td><td class='num'>31,654</td><td class='num'>+0.4%</td></tr>
+<tr><td><strong>D2</strong><br><span class='sub'>Attention 长序列 (sl=1024)</span></td><td class='num'>—</td><td class='num'>1024</td><td class='num'>1</td><td class='num'>4</td><td class='num'>271.0</td><td class='num'>270.2</td><td class='num'>-0.3%</td><td class='num'>60,449</td><td class='num'>60,633</td><td class='num'>+0.3%</td></tr>
+<tr><td><strong>D3</strong><br><span class='sub'>Attention 大 batch (bs=2)</span></td><td class='num'>—</td><td class='num'>512</td><td class='num'>2</td><td class='num'>4</td><td class='num'>270.5</td><td class='num'>269.9</td><td class='num'>-0.2%</td><td class='num'>60,561</td><td class='num'>60,710</td><td class='num'>+0.2%</td></tr>
+</table>
+
+<h2>10. 结论</h2>
+<div class="card">
+<ul>
+  <li><strong>MoE All-to-All</strong>：AR ON 在 M1/M4/M5/M8 有 <strong>+1% ~ +5%</strong> 吞吐提升；M1 baseline 最明显 (273→259 ms/step, +5.1%)。</li>
+  <li><strong>Dense AllReduce</strong>：AR 影响 <strong>&lt;0.5%</strong>，compute bound，通信非瓶颈。</li>
+  <li><strong>MoE 层数翻倍 (M6)</strong>：ms/step ~308ms → ~580ms，接近线性（4 层 × 2 次 All-to-All）。</li>
+  <li><strong>EP=8 vs EP=16 (M7 vs M4)</strong>：tok/s 相近 (~28K vs ~27K)，2 节点下 EP 拓扑影响有限。</li>
+</ul>
+</div>
+
+<h2>11. 已知限制</h2>
+<ul>
+  <li>非真实权重训练：未加载 DSV4-Flash FP8 checkpoint，仅模拟架构与通信模式。</li>
+  <li>Expert 未分片：每 rank 持有 128 expert 副本（真实 EP 会分片到 16 ranks）。</li>
+  <li>MoE routing 为简化 Python 实现，compute 占比高于生产环境。</li>
+  <li>AR 对比仅 QPS=8，未做 QPS sweep。</li>
+  <li>单次 6 step 采样，未做多轮重复取置信区间。</li>
+</ul>
+
+<h2>12. 产出文件</h2>
+<table>
+<tr><th>类型</th><th>路径</th></tr>
+<tr><td>运行脚本</td><td><code>/root/jianxiong/5k_test/run_dsv4_train_2node_10_11.sh</code></td></tr>
+<tr><td>报告生成</td><td><code>/root/jianxiong/5k_test/generate_dsv4_train_2node_report.py</code></td></tr>
+<tr><td>汇总 CSV</td><td><code>/root/jianxiong/5k_test/results/dsv4_train_2node_summary_20260628_144914_fixed.csv</code></td></tr>
+<tr><td>各 case JSON</td><td><code>/root/jianxiong/5k_test/results/dsv4_*_TIMESTAMP.json</code></td></tr>
+<tr><td>完整日志</td><td><code>/root/jianxiong/5k_test/logs/dsv4_train_2node_full_run.log</code></td></tr>
+</table>
+
+</body>
+</html>
